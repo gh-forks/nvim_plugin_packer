@@ -41,16 +41,39 @@ else
   util.is_windows = package.config:sub(1, 1) == '\\'
 end
 
+if util.is_windows and vim.o.shellslash then
+  util.use_shellslash = true
+else
+  util.use_shallslash = false
+end
+
 util.get_separator = function()
-  if util.is_windows then
+  if util.is_windows and not util.use_shellslash then
     return '\\'
   end
   return '/'
 end
 
+util.strip_trailing_sep = function(path)
+  local res, _ = string.gsub(path, util.get_separator() .. '$', '', 1)
+  return res
+end
+
 util.join_paths = function(...)
   local separator = util.get_separator()
   return table.concat({ ... }, separator)
+end
+
+util.get_plugin_short_name = function(plugin)
+  local path = vim.fn.expand(plugin[1])
+  local name_segments = vim.split(path, util.get_separator())
+  local segment_idx = #name_segments
+  local name = plugin.as or name_segments[segment_idx]
+  while name == '' and segment_idx > 0 do
+    name = name_segments[segment_idx]
+    segment_idx = segment_idx - 1
+  end
+  return name, path
 end
 
 util.get_plugin_full_name = function(plugin)
@@ -65,6 +88,10 @@ util.get_plugin_full_name = function(plugin)
   end
 
   return plugin_name
+end
+
+util.remove_ending_git_url = function(url)
+  return vim.endswith(url, '.git') and url:sub(1, -5) or url
 end
 
 util.deep_extend = function(policy, ...)

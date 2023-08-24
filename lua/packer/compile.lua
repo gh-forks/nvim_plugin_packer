@@ -33,6 +33,20 @@ vim.api.nvim_command('packadd packer.nvim')
 local no_errors, error_msg = pcall(function()
 ]]
 
+local enter_packer_compile = [[
+_G._packer = _G._packer or {}
+_G._packer.inside_compile = true
+]]
+
+local exit_packer_compile = [[
+
+_G._packer.inside_compile = false
+if _G._packer.needs_bufread == true then
+  vim.cmd("doautocmd BufRead")
+end
+_G._packer.needs_bufread = false
+]]
+
 local catch_errors = [[
 catch
   echohl ErrorMsg
@@ -46,6 +60,7 @@ local catch_errors_lua = [[
 end)
 
 if not no_errors then
+  error_msg = error_msg:gsub('"', '\\"')
   vim.api.nvim_command('echohl ErrorMsg | echom "Error in packer_compiled: '..error_msg..'" | echom "Please check your config for correctness" | echohl None')
 end
 ]]
@@ -55,23 +70,23 @@ end
 local profile_time = function(should_profile)
   return fmt(
     [[
-  local time
-  local profile_info
-  local should_profile = %s
-  if should_profile then
-    local hrtime = vim.loop.hrtime
-    profile_info = {}
-    time = function(chunk, start)
-      if start then
-        profile_info[chunk] = hrtime()
-      else
-        profile_info[chunk] = (hrtime() - profile_info[chunk]) / 1e6
-      end
+local time
+local profile_info
+local should_profile = %s
+if should_profile then
+  local hrtime = vim.loop.hrtime
+  profile_info = {}
+  time = function(chunk, start)
+    if start then
+      profile_info[chunk] = hrtime()
+    else
+      profile_info[chunk] = (hrtime() - profile_info[chunk]) / 1e6
     end
-  else
-    time = function(chunk, start) end
   end
-  ]],
+else
+  time = function(chunk, start) end
+end
+]],
     vim.inspect(should_profile)
   )
 end
@@ -89,8 +104,10 @@ local function save_profiles(threshold)
       results[i] = elem[1] .. ' took ' .. elem[2] .. 'ms'
     end
   end
+  if threshold then
+    table.insert(results, '(Only showing plugins that took longer than ' .. threshold .. ' ms ' .. 'to load)')
+  end
 
-  _G._packer = _G._packer or {}
   _G._packer.profile_output = results
 end
 ]]
@@ -114,7 +131,7 @@ end
 
 local try_loadstring = [[
 local function try_loadstring(s, component, name)
-  local success, result = pcall(loadstring(s))
+  local success, result = pcall(loadstring(s), name, _G.packer_plugins[name])
   if not success then
     vim.schedule(function()
       vim.api.nvim_notify('packer.nvim: Error running ' .. component .. ' for ' .. name .. ': ' .. result, vim.log.levels.ERROR, {})
@@ -161,22 +178,6 @@ local function timed_chunk(chunk, name, output_table)
   end
 
   output_table[#output_table + 1] = 'time([[' .. name .. ']], false)'
-  return output_table
-end
-
--- We special-case timing for conditionals because we can't directly wrap the condition test
-local function timed_condition(condition, body, name, output_table)
-  output_table = output_table or {}
-  local condition_time_call = 'time("' .. name .. '", '
-  output_table[#output_table + 1] = condition_time_call .. 'true)'
-  output_table[#output_table + 1] = 'if'
-  output_table[#output_table + 1] = condition
-  output_table[#output_table + 1] = 'then'
-  output_table[#output_table + 1] = condition_time_call .. 'false)'
-  output_table[#output_table + 1] = body
-  output_table[#output_table + 1] = 'else'
-  output_table[#output_table + 1] = condition_time_call .. 'false)'
-  output_table[#output_table + 1] = 'end'
   return output_table
 end
 
@@ -264,7 +265,6 @@ local function make_loaders(_, plugins, output_lua, should_profile)
   local fts = {}
   local events = {}
   local condition_ids = {}
-  local condition_bytecode = {}
   local commands = {}
   local keymaps = {}
   local after = {}
@@ -273,8 +273,10 @@ local function make_loaders(_, plugins, output_lua, should_profile)
   local module_lazy_loads = {}
   for name, plugin in pairs(plugins) do
     if not plugin.disable then
+      plugin.simple_load = true
       local quote_name = "'" .. name .. "'"
       if plugin.config and not plugin.executable_config then
+        plugin.simple_load = false
         plugin.executable_config = {}
         if type(plugin.config) ~= 'table' then
           plugin.config = { plugin.config }
@@ -306,11 +308,17 @@ local function make_loaders(_, plugins, output_lua, should_profile)
       }
 
       if plugin.opt then
+        plugin.simple_load = false
         loaders[name].after_files = detect_after_plugin(name, loaders[name].path)
-        loaders[name].needs_bufread = detect_bufread(loaders[name].path)
+        if plugin.bufread ~= nil then
+          loaders[name].needs_bufread = plugin.bufread
+        else
+          loaders[name].needs_bufread = detect_bufread(loaders[name].path)
+        end
       end
 
       if plugin.setup then
+        plugin.simple_load = false
         if type(plugin.setup) ~= 'table' then
           plugin.setup = { plugin.setup }
         end
@@ -324,9 +332,38 @@ local function make_loaders(_, plugins, output_lua, should_profile)
         setup[name] = plugin.setup
       end
 
-      if plugin.ft then
+      -- Keep this as first opt loader to maintain only_cond ?
+      if plugin.cond ~= nil then
+        plugin.simple_load = false
         loaders[name].only_sequence = false
         loaders[name].only_setup = false
+        loaders[name].only_cond = true
+        if type(plugin.cond) ~= 'table' then
+          plugin.cond = { plugin.cond }
+        end
+
+        for _, condition in ipairs(plugin.cond) do
+          loaders[name].cond = {}
+          if type(condition) == 'function' then
+            _, condition = make_try_loadstring(condition, 'condition', name)
+          elseif type(condition) == 'string' then
+            condition = 'return ' .. condition
+          end
+
+          condition_ids[condition] = condition_ids[condition] or {}
+          table.insert(loaders[name].cond, condition)
+          table.insert(condition_ids[condition], name)
+        end
+      end
+
+      -- Add the git URL for displaying in PackerStatus and PackerSync. https://github.com/wbthomason/packer.nvim/issues/542
+      loaders[name].url = plugin.url
+
+      if plugin.ft then
+        plugin.simple_load = false
+        loaders[name].only_sequence = false
+        loaders[name].only_setup = false
+        loaders[name].only_cond = false
         vim.list_extend(ftdetect_paths, detect_ftdetect(name, loaders[name].path))
         if type(plugin.ft) == 'string' then
           plugin.ft = { plugin.ft }
@@ -338,8 +375,10 @@ local function make_loaders(_, plugins, output_lua, should_profile)
       end
 
       if plugin.event then
+        plugin.simple_load = false
         loaders[name].only_sequence = false
         loaders[name].only_setup = false
+        loaders[name].only_cond = false
         if type(plugin.event) == 'string' then
           if not plugin.event:find '%s' then
             plugin.event = { plugin.event .. ' *' }
@@ -357,27 +396,11 @@ local function make_loaders(_, plugins, output_lua, should_profile)
         end
       end
 
-      if plugin.cond then
-        loaders[name].only_sequence = false
-        loaders[name].only_setup = false
-        if type(plugin.cond) == 'string' or type(plugin.cond) == 'function' then
-          plugin.cond = { plugin.cond }
-        end
-
-        for _, condition in ipairs(plugin.cond) do
-          if type(condition) == 'function' then
-            condition = vim.inspect(string.dump(condition, true))
-            condition_bytecode[condition] = true
-          end
-
-          condition_ids[condition] = condition_ids[condition] or {}
-          table.insert(condition_ids[condition], name)
-        end
-      end
-
       if plugin.cmd then
+        plugin.simple_load = false
         loaders[name].only_sequence = false
         loaders[name].only_setup = false
+        loaders[name].only_cond = false
         if type(plugin.cmd) == 'string' then
           plugin.cmd = { plugin.cmd }
         end
@@ -391,8 +414,10 @@ local function make_loaders(_, plugins, output_lua, should_profile)
       end
 
       if plugin.keys then
+        plugin.simple_load = false
         loaders[name].only_sequence = false
         loaders[name].only_setup = false
+        loaders[name].only_cond = false
         if type(plugin.keys) == 'string' then
           plugin.keys = { plugin.keys }
         end
@@ -408,6 +433,7 @@ local function make_loaders(_, plugins, output_lua, should_profile)
       end
 
       if plugin.after then
+        plugin.simple_load = false
         loaders[name].only_setup = false
 
         if type(plugin.after) == 'string' then
@@ -421,6 +447,7 @@ local function make_loaders(_, plugins, output_lua, should_profile)
       end
 
       if plugin.wants then
+        plugin.simple_load = false
         if type(plugin.wants) == 'string' then
           plugin.wants = { plugin.wants }
         end
@@ -428,6 +455,7 @@ local function make_loaders(_, plugins, output_lua, should_profile)
       end
 
       if plugin.fn then
+        plugin.simple_load = false
         loaders[name].only_sequence = false
         loaders[name].only_setup = false
         if type(plugin.fn) == 'string' then
@@ -440,8 +468,10 @@ local function make_loaders(_, plugins, output_lua, should_profile)
       end
 
       if plugin.module or plugin.module_pattern then
+        plugin.simple_load = false
         loaders[name].only_sequence = false
         loaders[name].only_setup = false
+        loaders[name].only_cond = false
 
         if plugin.module then
           if type(plugin.module) == 'string' then
@@ -463,6 +493,7 @@ local function make_loaders(_, plugins, output_lua, should_profile)
       end
 
       if plugin.config and (not plugin.opt or loaders[name].only_setup) then
+        plugin.simple_load = false
         plugin.only_config = true
         configs[name] = plugin.executable_config
       end
@@ -523,43 +554,36 @@ local function make_loaders(_, plugins, output_lua, should_profile)
   end
 
   local conditionals = {}
-  for condition, names in pairs(condition_ids) do
-    local conditional_loads = {}
+  for _, names in pairs(condition_ids) do
     for _, name in ipairs(names) do
-      timed_chunk(
-        fmt('\trequire("packer.load")({"%s"}, {}, _G.packer_plugins)', name),
-        'packadd for ' .. name,
-        conditional_loads
-      )
-      if plugins[name].config then
-        local lines = { '-- Config for: ' .. name }
-        timed_chunk(plugins[name].executable_config, 'Config for ' .. name, lines)
-        vim.list_extend(conditional_loads, lines)
+      if loaders[name].only_cond then
+        timed_chunk(
+          fmt('  require("packer.load")({"%s"}, {}, _G.packer_plugins)', name),
+          'Conditional loading of ' .. name,
+          conditionals
+        )
       end
     end
-    local executable_conditional = condition
-    if condition_bytecode[condition] then
-      executable_conditional = 'try_loadstring(' .. condition .. ', "condition", \'' .. vim.inspect(names) .. "')"
-    end
-
-    vim.list_extend(
-      conditionals,
-      timed_condition(
-        executable_conditional,
-        table.concat(conditional_loads, '\n\t'),
-        'Condition for ' .. vim.inspect(names):gsub('"', "'")
-      )
-    )
   end
 
   local command_defs = {}
   for command, names in pairs(commands) do
     local command_line
     if string.match(command, '^%w+$') then
+      -- Better command completions here are due to @folke and @lewis6991
       command_line = fmt(
-        'pcall(vim.cmd, [[command -nargs=* -range -bang -complete=file %s lua require("packer.load")({%s}, { cmd = "%s", l1 = <line1>, l2 = <line2>, bang = <q-bang>, args = <q-args> }, _G.packer_plugins)]])',
+        [[pcall(vim.api.nvim_create_user_command, '%s', function(cmdargs)
+          require('packer.load')({%s}, { cmd = '%s', l1 = cmdargs.line1, l2 = cmdargs.line2, bang = cmdargs.bang, args = cmdargs.args, mods = cmdargs.mods }, _G.packer_plugins)
+        end,
+        {nargs = '*', range = true, bang = true, complete = function()
+          require('packer.load')({%s}, {}, _G.packer_plugins)
+          return vim.fn.getcompletion('%s ', 'cmdline')
+      end})]],
         command,
         table.concat(names, ', '),
+        command,
+        table.concat(names, ', '),
+        command,
         command
       )
     else
@@ -601,10 +625,12 @@ local function make_loaders(_, plugins, output_lua, should_profile)
     if plugins[pre].opt then
       loaders[pre].after = posts
     elseif plugins[pre].only_config then
-      loaders[pre] = { after = posts, only_sequence = true, only_config = true }
+      loaders[pre].after = posts
+      loaders[pre].only_sequence = true
+      loaders[pre].only_config = true
     end
 
-    if plugins[pre].opt or plugins[pre].only_config then
+    if plugins[pre].simple_load or plugins[pre].opt or plugins[pre].only_config then
       for _, name in ipairs(posts) do
         loaders[name].load_after = {}
         sequence_loads[name] = sequence_loads[name] or {}
@@ -694,6 +720,7 @@ local function make_loaders(_, plugins, output_lua, should_profile)
     table.insert(result, feature_guard)
     table.insert(result, 'lua << END')
   end
+  table.insert(result, enter_packer_compile)
   table.insert(result, profile_time(should_profile))
   table.insert(result, profile_output)
   timed_chunk(luarocks.generate_path_setup(), 'Luarocks path setup', result)
@@ -777,6 +804,8 @@ local function make_loaders(_, plugins, output_lua, should_profile)
 
     table.insert(result, 'vim.cmd("augroup END")')
   end
+
+  table.insert(result, exit_packer_compile)
 
   table.insert(result, conditionally_output_profile(config.threshold))
   if output_lua then
